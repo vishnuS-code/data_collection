@@ -1,478 +1,353 @@
 # main.py
-
+import time
 import datetime
 import os
 import streamlit as st
 import paramiko
-from db import Fetch_data,RemoteFetchData
+from db import Fetch_data, RemoteFetchData
+from doff_based import DoffBasedZipHandler
+from fullrole_based import FullRollZipper
 from config import config
+import subprocess,traceback
 
-# -------------------- DB Fetch -------------------- #
 fetcher = Fetch_data()
 
-# -------------------- SSH Helpers -------------------- #
-MDD_DIR = "/home/kniti/projects/knit-i/knitting-core/data"
-FDA_DIR = "/home/kniti/projects/knit-i/knitting-core/images"
 
+class MachineManager:
+    def __init__(self):
+        self.fetcher = Fetch_data()
+        self.MDD_DIR = "/home/kniti/projects/knit-i/knitting-core/data"
+        self.FDA_DIR = "/home/kniti/projects/knit-i/knitting-core/images"
+        self.CLOUD_UPLOAD_DIR = "/home/kniti/MegaUpload"
 
+        # Session state setup
+        if "connected" not in st.session_state:
+            st.session_state.connected = False
+        if "machine_ssh" not in st.session_state:
+            st.session_state.machine_ssh = None
+        if "storage_ssh" not in st.session_state:
+            st.session_state.storage_ssh = None
 
-
-def handle_mda_doff_based_zip(choice, roll_path, roll_number, selected_date, ssh_client):
-    """
-    Handles the Doff-based Zip workflow:
-    - Lets user pick cameras & defect types
-    - Lets user set doff range
-    - Filters matching files
-    - Creates a zip on the remote storage
-    """
-    try:
-        if choice != "Doff-based Zip":
-            return
-
-
-        st.subheader("Doff-based Data Collection")
-
-        selected_date_str = str(selected_date).split(" ")[0]  # e.g. "2025-08-21"
-        date_folder = os.path.join(roll_path, selected_date_str)
-
-        # --- Verify date folder exists ---
-        stdin, stdout, stderr = ssh_client.exec_command(f"ls {roll_path}")
-        available_dates = stdout.read().decode().splitlines()
-
-        if selected_date_str not in available_dates:
-            st.warning(f"No folder for selected roll and date: {selected_date_str}")
-            return
-
-        # --- Step 1: List cameras (multi-select) ---
-        stdin, stdout, stderr = ssh_client.exec_command(f"ls {date_folder}")
-        cameras = stdout.read().decode().splitlines()
-
-        if not cameras:
-            st.warning("No cameras found inside this roll/date folder")
-            return
-
-        selected_cameras = st.multiselect("Select Cameras", cameras)
-
-        if not selected_cameras:
-            return
-
-        # --- Step 2: Build union of defect types across cameras ---
-        union_defects = set()
-        cam_defect_paths = {}
-        for cam in selected_cameras:
-            defect_label_path = os.path.join(date_folder, cam, "defect", "labels")
-            cam_defect_paths[cam] = defect_label_path
-            stdin, stdout, stderr = ssh_client.exec_command(f"ls {defect_label_path}")
-            defect_types = stdout.read().decode().splitlines()
-            union_defects.update(defect_types)
-
-        union_defects = sorted(union_defects)
-        if not union_defects:
-            st.warning("No defect labels found for the selected cameras")
-            return
-
-        selected_defects = st.multiselect("Select Defect Types", union_defects)
-
-        if not selected_defects:
-            return
-
-        # --- Step 3: Ask for doff range ---
-        st.subheader("Select Doff Range")
-        min_doff_input = st.number_input("Enter Minimum Doff ID", min_value=0, step=1, value=0)
-        max_doff_input = st.number_input("Enter Maximum Doff ID", min_value=0, step=1, value=0)
-
-        if min_doff_input > max_doff_input:
-            st.warning("⚠️ Minimum doff cannot be greater than maximum doff")
-            return
-
-        # --- Step 4: Collect all matching files ---
-        all_files = []
-        for cam in selected_cameras:
-            for defect in selected_defects:
-                defect_path = os.path.join(cam_defect_paths[cam], defect)
-                stdin, stdout, stderr = ssh_client.exec_command(f"ls {defect_path}")
-                files = stdout.read().decode().splitlines()
-                for f in files:
-                    if f:
-                        all_files.append(os.path.join(defect_path, f))
-
-        def extract_doff(filename: str):
-            try:
-                parts = filename.split("_")
-                return int(parts[2])  # 3rd position
-            except Exception:
-                return None
-
-        files_in_range = [
-            f for f in all_files
-            if (lambda d: d is not None and min_doff_input <= d <= max_doff_input)(
-                extract_doff(os.path.basename(f))
+    def connect_ssh(self, ip, username="supernova", password="Charlemagne@1", timeout=15):
+        """Connect to a remote machine via Paramiko SSH."""
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(
+                hostname=ip,
+                username=username,
+                password=password,
+                timeout=timeout,
+                look_for_keys=False,
+                allow_agent=False
             )
-        ]
+            st.success(f"Successfully connected to {ip}")
+            return client
+        except Exception as e:
+            st.error(f"Machine {ip} is offline or SSH connection failed: {e}")
+            print(traceback.format_exc())
+            return None
 
-        if not files_in_range:
-            st.warning(f"No files found in doff range {min_doff_input} – {max_doff_input}")
+    def connect_storage_through_machine(self, machine_client, storage_ip, username="supernova", password="Charlemagne@1"):
+        """Connect to storage unit through an already-connected machine (jump host)."""
+        try:
+            transport = machine_client.get_transport()
+            dest_addr = (storage_ip, 22)
+            local_addr = ("127.0.0.1", 0)
+            channel = transport.open_channel("direct-tcpip", dest_addr, local_addr)
+
+            storage_client = paramiko.SSHClient()
+            storage_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            storage_client.connect(
+                hostname=storage_ip,
+                username=username,
+                password=password,
+                sock=channel,
+                look_for_keys=False,
+                allow_agent=False
+            )
+            st.success(f"Successfully connected to Storage Unit {storage_ip} via machine")
+            return storage_client
+        except Exception as e:
+            st.error(f"Failed to connect to Storage Unit {storage_ip} via machine: {e}")
+            print(traceback.format_exc())
+            return None
+
+    def select_mill_and_machine(self):
+        """Dropdowns for selecting Mill and Machine."""
+        try:
+            selected_mill_info = None
+            selected_machine_info = None
+
+            mill_list = self.fetcher.fetch_mill_details()
+            if not mill_list:
+                st.error("No mills found in the database.")
+                return selected_mill_info, selected_machine_info
+
+            mill_map = {mill['mill_name']: mill['milldetails_id'] for mill in mill_list}
+            selected_mill_name = st.selectbox("Select Mill", ["--Select--"] + list(mill_map.keys()))
+
+            if selected_mill_name != "--Select--":
+                selected_mill_id = mill_map[selected_mill_name]
+                selected_mill_info = next(m for m in mill_list if m['milldetails_id'] == selected_mill_id)
+
+                machine_list = self.fetcher.fetch_machine_details(selected_mill_id)
+                if not machine_list:
+                    st.warning("No machines found for this mill.")
+                    return selected_mill_info, selected_machine_info
+
+                machine_map = {m['machine_name']: m['machinedetail_id'] for m in machine_list}
+                selected_machine_name = st.selectbox("Select Machine", ["--Select--"] + list(machine_map.keys()))
+
+                if selected_machine_name != "--Select--":
+                    selected_machine_id = machine_map[selected_machine_name]
+                    selected_machine_info = next(m for m in machine_list if m['machinedetail_id'] == selected_machine_id)
+
+            return selected_mill_info, selected_machine_info
+        except Exception as e:
+            st.error(f"Error selecting mill or machine: {e}")
+            print(traceback.format_exc())
+            return None, None
+
+    def connect_to_machine_and_storage(self, machine_info):
+        """SSH into machine and storage with proper validation and error handling."""
+        import traceback
+        import re
+
+        ip_address = machine_info.get("ip_address")
+        if not ip_address:
+            st.error("❌ No machine IP provided in machine_info")
             return
 
-        # --- Step 5: Zip creation ---
-        custom_zip_name = st.text_input("Enter a name for the doff zip file (without extension):")
+        st.write(f"Machine IP: {ip_address}")
 
-        if custom_zip_name and st.button("Zip IT"):
-            remote_dest_dir = "/home/kniti/MegaUpload"
-            remote_zip = f"{remote_dest_dir}/{custom_zip_name}.zip"
+        if not st.session_state.get("connected", False):
+            if st.button(f"Connect to Machine {ip_address}"):
+                try:
+                    # Connect to Machine
+                    ssh = self.connect_ssh(ip_address)
+                    if not ssh:
+                        st.error(f"❌ Could not connect to machine at {ip_address}")
+                        return
 
-            # Ensure remote dir exists
-            mkdir_cmd = f"mkdir -p {remote_dest_dir}"
-            ssh_client.exec_command(mkdir_cmd)
+                    hostname = ssh.exec_command("hostname")[1].read().decode().strip()
 
-            roll_parent = os.path.dirname(roll_path)
+                    # Fetch coreconfig.ini content using cat
+                    stdin, stdout, stderr = ssh.exec_command("cat /home/kniti/projects/knit-i/config/coreconfig.ini")
+                    config_text = stdout.read().decode().strip()
+                    if not config_text:
+                        st.error("❌ Could not read coreconfig.ini on machine")
+                        return
 
-            rel_paths = [os.path.relpath(f, roll_parent) for f in files_in_range]
+                    # Extract storage_ip using regex
+                    match = re.search(r"storage_ip\s*=\s*([0-9.]+)", config_text)
+                    storage_ip = match.group(1) if match else None
 
-            # Prepare newline-separated list of files
-            file_list = "\n".join(rel_paths)
+                    if not storage_ip:
+                        st.error("❌ No 'storage_ip' found in coreconfig.ini under [Core]")
+                        return
 
-            # Use `zip -@` to read from stdin
-            zip_cmd = f"cd '{roll_parent}' && zip -@ '{remote_zip}'"
+                    st.write(f"📦 Storage IP from config: {storage_ip}")
 
-            stdin, stdout, stderr = ssh_client.exec_command(zip_cmd)
-            stdin.write(file_list + "\n")
-            stdin.channel.shutdown_write()  # signal EOF
+                    # Connect to Storage through Machine
+                    storage_ssh = self.connect_storage_through_machine(ssh, storage_ip)
+                    if not storage_ssh:
+                        st.error(f"❌ Failed to connect to Storage Unit at {storage_ip}")
+                        return
 
+                    storage_hostname = storage_ssh.exec_command("hostname")[1].read().decode().strip()
+
+                    # Save sessions
+                    st.session_state.machine_ssh = ssh
+                    st.session_state.storage_ssh = storage_ssh
+                    st.session_state.connected = True
+
+                except Exception as e:
+                    st.error(f"❌ Error during connection: {e}")
+                    print(traceback.format_exc())
+                    return
+
+    def copy_upload_script(self):
+        """Ensure upload_to_onedrive.sh exists on remote storage (always replace)."""
+        local_script = os.path.join(os.path.dirname(__file__), "upload_to_onedrive.sh")
+        remote_script = "/home/kniti/upload_to_onedrive.sh"
+
+        if not os.path.exists(local_script):
+            st.error(f"❌ Local script not found: {local_script}")
+            return
+
+        try:
+            sftp = st.session_state.storage_ssh.open_sftp()
+            try:
+                sftp.remove(remote_script)
+                st.info("ℹ️ Existing upload_to_onedrive.sh deleted")
+            except FileNotFoundError:
+                pass
+
+            sftp.put(local_script, remote_script)
+            sftp.close()
+
+            stdin, stdout, stderr = st.session_state.storage_ssh.exec_command(f"chmod +x {remote_script}")
             exit_status = stdout.channel.recv_exit_status()
 
             if exit_status != 0:
-                st.error(f"Failed to create doff zip file: {stderr.read().decode()}")
-            else:
-                st.success(f"✅ Doff-based zip created at: {remote_zip}")
-                st.write(f"File available in remote path: `{remote_zip}`")
-    except Exception as e:
-        st.error(f"Error in Doff-based Zip: {e}")
-
-
-def connect_ssh(ip, username="supernova", password="Charlemagne@1", timeout=15):
-    """
-    Connect to a remote machine via Paramiko SSH.
-    Returns ssh client if successful, else None.
-    """
-    try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            hostname=ip,
-            username=username,
-            password=password,
-            timeout=timeout,
-            look_for_keys=False,
-            allow_agent=False
-        )
-        st.success(f"Successfully connected to {ip}")
-        return client
-    except Exception as e:
-        st.error(f"Machine {ip} is offline or SSH connection failed: {e}")
-        return None
-
-def connect_storage_through_machine(machine_client, storage_ip, username="supernova", password="Charlemagne@1"):
-    """
-    Connect to storage unit through an already-connected machine (jump host).
-    """
-    try:
-        transport = machine_client.get_transport()
-        dest_addr = (storage_ip, 22)
-        local_addr = ("127.0.0.1", 0)
-        channel = transport.open_channel("direct-tcpip", dest_addr, local_addr)
-
-        storage_client = paramiko.SSHClient()
-        storage_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        storage_client.connect(
-            hostname=storage_ip,
-            username=username,
-            password=password,
-            sock=channel,
-            look_for_keys=False,
-            allow_agent=False
-        )
-        st.success(f"Successfully connected to Storage Unit {storage_ip} via machine")
-        return storage_client
-    except Exception as e:
-        st.error(f"Failed to connect to Storage Unit {storage_ip} via machine: {e}")
-        return None
-
-
-def handle_fda_doff_based_zip(choice, roll_path, roll_number, selected_date, ssh_client, db=None, machineprgdtl_id=None):
-    try:
-        if choice != "Doff-based Zip":
-            return
-
-        st.subheader("FDA Doff-based Zip")
-
-        # --- Step 1: List cameras ---
-        date_folder = os.path.join(roll_path, str(selected_date))
-        stdin, stdout, stderr = ssh_client.exec_command(f"ls {date_folder}")
-        cams = [c for c in stdout.read().decode().splitlines() if c.startswith("blackcam")]
-
-        if not cams:
-            st.error("❌ No blackcam cameras found")
-            return
-
-        cams_selected = st.multiselect("Select Camera(s)", cams, key="fda_cam_select")
-        if not cams_selected:
-            return
-
-        # --- Step 2: Enter doff range ---
-        col1, col2 = st.columns(2)
-        with col1:
-            start_doff = st.number_input("Enter Start Doff", min_value=0, step=1, key="fda_start_doff")
-        with col2:
-            end_doff = st.number_input("Enter End Doff", min_value=0, step=1, key="fda_end_doff")
-
-        if start_doff > end_doff:
-            st.warning("⚠️ Start doff must be <= End doff")
-            return
-
-        # --- Step 3: Collect matching files ---
-        all_files = []
-
-        for cam in cams_selected:
-            defect_path = os.path.join(date_folder, cam)
-            stdin, stdout, stderr = ssh_client.exec_command(f"find {defect_path} -type f -name '*.jpg'")
-            files = stdout.read().decode().splitlines()
-
-            for f in files:
-                basename = os.path.basename(f)
-                try:
-                    doff = int(basename.split("_")[3])
-                except Exception:
-                    continue
-                if start_doff <= doff <= end_doff:
-                    all_files.append(f)
-
-        if not all_files:
-            st.warning(f"❌ No files found in doff range {start_doff}-{end_doff} for selected cameras")
-            return
-        else:
-            st.info(f"✅ Found {len(all_files)} files in doff range {start_doff}-{end_doff}")
-
-        # --- Step 4: Fetch machine program details if db and machineprgdtl_id provided ---
-        program_details_file = None
-        if db and machineprgdtl_id:
-            details = db.fetch_machine_program_detail(machineprgdtl_id)
-            if details:
-                program_details_file = f"/tmp/program_details_{roll_number}.txt"
-                sftp = ssh_client.open_sftp()
-                with sftp.file(program_details_file, "w") as f:
-                    for k, v in details.items():
-                        f.write(f"{k}: {v}\n")
-                sftp.close()
-                all_files.append(program_details_file)  # add to zip
-
-        # --- Step 5: Enter zip filename ---
-        cam_names = "_".join(cams_selected)
-        custom_zip_name = st.text_input("Enter zip filename (without extension):", key="fda_zip_name")
-
-        if st.button("Zip IT", key="fda_zip_btn"):
-            remote_dest_dir = "/home/kniti/MegaUpload"
-            remote_zip = f"{remote_dest_dir}/{custom_zip_name}.zip"
-
-            ssh_client.exec_command(f"mkdir -p {remote_dest_dir}")
-
-            # --- Step 6: Write file list to remote temp file for zip ---
-            temp_file = f"/tmp/fda_file_list_{roll_number}.txt"
-            sftp = ssh_client.open_sftp()
-            with sftp.file(temp_file, "w") as f:
-                f.write("\n".join(all_files) + "\n")
-            sftp.close()
-
-            zip_cmd = f"zip -r {remote_zip} -@ < {temp_file}"
-
-            with st.spinner(f"Creating zip of {len(all_files)} files..."):
-                stdin, stdout, stderr = ssh_client.exec_command(zip_cmd)
+                st.warning("⚠️ chmod failed, retrying with sudo...")
+                stdin, stdout, stderr = st.session_state.storage_ssh.exec_command(f"sudo chmod +x {remote_script}")
                 exit_status = stdout.channel.recv_exit_status()
 
-            if exit_status != 0:
-                st.error(f"❌ Failed to create zip: {stderr.read().decode()}")
-            else:
-                st.success(f"✅ FDA doff-based zip created at: {remote_zip}")
+                if exit_status != 0:
+                    error_msg = stderr.read().decode().strip()
+                    st.error(f"❌ Failed to set permissions even with sudo: {error_msg}")
+                    return
 
-    except Exception as e:
-        st.error(f"Error in FDA doff-based zip: {e}")
-
-
-def select_mill_and_machine():
-    try:
-        selected_mill_info = None
-        selected_machine_info = None
-
-        mill_list = fetcher.fetch_mill_details()
-        if not mill_list:
-            st.error("No mills found in the database.")
-            return selected_mill_info, selected_machine_info
-
-        mill_map = {mill['mill_name']: mill['milldetails_id'] for mill in mill_list}
-        selected_mill_name = st.selectbox("Select Mill", ["--Select--"] + list(mill_map.keys()))
-
-        if selected_mill_name != "--Select--":
-            selected_mill_id = mill_map[selected_mill_name]
-            selected_mill_info = next(m for m in mill_list if m['milldetails_id'] == selected_mill_id)
-
-            machine_list = fetcher.fetch_machine_details(selected_mill_id)
-            if not machine_list:
-                st.warning("No machines found for this mill.")
-                return selected_mill_info, selected_machine_info
-
-            machine_map = {m['machine_name']: m['machinedetail_id'] for m in machine_list}
-            selected_machine_name = st.selectbox("Select Machine", ["--Select--"] + list(machine_map.keys()))
-
-            if selected_machine_name != "--Select--":
-                selected_machine_id = machine_map[selected_machine_name]
-                selected_machine_info = next(m for m in machine_list if m['machinedetail_id'] == selected_machine_id)
-
-        return selected_mill_info, selected_machine_info
-    except Exception as e:
-        st.error(f"Error selecting mill or machine: {e}")
-        return None, None
-# -------------------- Streamlit App -------------------- #
-
-st.title("Data Collector Software")
-
-# --- Step 1: Select Mill & Machine ---
-mill_info, machine_info = select_mill_and_machine()
-
-if machine_info:
-    ip_address = machine_info.get("ip_address")
-    st.write(f"Machine IP: {ip_address}")
-
-    # Initialize session state holders
-    st.session_state.setdefault("machine_ssh", None)
-    st.session_state.setdefault("storage_ssh", None)
-    st.session_state.setdefault("custom_zip_name", "")
-    st.session_state.setdefault("selected_roll", "--Select--")
-    st.session_state.setdefault("choice", "--Select--")
+            st.success("📂 upload_to_onedrive.sh copied and made executable")
+        except Exception as e:
+            st.error(f"❌ Failed to copy upload_to_onedrive.sh: {e}")
 
 
-    # --- Step 2: Connect to Machine & Storage Unit ---
-    if ip_address:
-        if st.button(f"Connect to Machine {ip_address}") or st.session_state.machine_ssh:
-            if not st.session_state.machine_ssh:
-                st.session_state.machine_ssh = connect_ssh(ip_address)
+    def select_roll(self, ip_address):
+        """Dropdown to select roll from DB by date."""
+        db = RemoteFetchData(ip_address)
+        selected_date = st.date_input(
+            "Select Roll Start Date",
+            value=None,
+            min_value=datetime.date(2020, 1, 1),
+            max_value=datetime.date.today()
+        )
 
-                if st.session_state.machine_ssh:
-                    # Fetch machine hostname
-                    stdin, stdout, stderr = st.session_state.machine_ssh.exec_command("hostname")
-                    hostname = stdout.read().decode().strip()
-                    if hostname:
-                        st.success(f"Connected to Machine: {hostname}")
-                    else:
-                        st.error("Failed to fetch machine hostname")
+        rolls = db.fetch_rolls_by_date(selected_date) if selected_date else []
+        if not rolls:
+            st.warning("No rolls found for selected date")
+            return None, None, None
 
-                    # Connect storage via machine
-                    storage_ip = config.get("Core", "storage_ip", fallback="169.254.0.3")
-                    st.session_state.storage_ssh = connect_storage_through_machine(
-                        st.session_state.machine_ssh, storage_ip
-                    )
+        roll_options = [f"{r[0]} - {r[1]}" for r in rolls]
+        selected_roll = st.selectbox("Select Roll Number & Name", ["--Select--"] + roll_options)
 
-                    if st.session_state.storage_ssh:
-                        stdin, stdout, stderr = st.session_state.storage_ssh.exec_command("hostname")
-                        storage_hostname = stdout.read().decode().strip()
-                        if storage_hostname:
-                            st.success(f"Connected to Storage Unit: {storage_hostname}")
-                        else:
-                            st.error("Failed to fetch storage hostname")
+        return db, selected_date, selected_roll
 
-            # --- Step 3: Select Roll Date ---
-            db = RemoteFetchData(ip_address)  # wrapper with fetch_roll_dates, fetch_rolls_by_date
-            roll_dates = db.fetch_roll_dates()
+# -------------------- Streamlit App -------------------- # 
 
-            if roll_dates:
-                selected_date = st.selectbox("Select Roll Start Date", ["--Select--"] + [str(d) for d in roll_dates])
-            else:
-                selected_date = "--Select--"
-                st.warning("No roll dates found in database")
+def main():
+    st.title("Data Collection Software")
 
-            if selected_date != "--Select--":
-                # --- Step 4: Fetch Rolls for Selected Date ---
-                rolls = db.fetch_rolls_by_date(selected_date)
+    manager = MachineManager()
 
-                if rolls:
-                    roll_options = [f"{r[0]} - {r[1]}" for r in rolls]
-                    selected_roll = st.selectbox(
-                        "Select Roll Number & Name",
-                        ["--Select--"] + roll_options,
-                        key="selected_roll"
-                    )
+    # -------------------------------
+    # Step 1: Select Mill & Machine
+    # -------------------------------
+    st.header("Step 1: Select Mill and Machine")
+    mill_info, machine_info = manager.select_mill_and_machine()
+    if not machine_info:
+        st.stop()
 
-                    if st.session_state.selected_roll != "--Select--":
-                        roll_number, roll_name = selected_roll.split(" - ", 1)
+    # -------------------------------
+    # Step 2: Connect to Machine & Storage
+    # -------------------------------
+    st.header("Step 2: Connect")
+    manager.connect_to_machine_and_storage(machine_info)
+    if not st.session_state.get("connected", False):
+        st.stop()
 
-                        # --- Step 5: Select Data Type ---
-                        st.subheader("Select Data Type on Storage Unit")
-                        data_type = st.radio("Choose Data Type:", ["MDD", "FDA"], index=0, key="data_type_radio")
+    # -------------------------------
+    # Step 3: Ensure upload script
+    # -------------------------------
+    st.header("Step 3: Prepare Upload Script")
+    manager.copy_upload_script()
 
-                        remote_dir = MDD_DIR if data_type == "MDD" else FDA_DIR
-                        roll_path = os.path.join(remote_dir, roll_name)
+    # -------------------------------
+    # Step 4: Select Roll
+    # -------------------------------
+    st.header("Step 4: Select Roll")
+    db, selected_date, selected_roll = manager.select_roll(machine_info["ip_address"])
+    if not selected_roll:
+        st.stop()
 
-                        st.success(f"Selected Roll: {roll_number} ({roll_name})")
-                        st.write(f"Remote Path: `{roll_path}`")
+    st.success(f"✅ Roll selected: {selected_roll} ({selected_date})")
+    time.sleep(1)
 
-                        if st.session_state.storage_ssh:
-                            stdin, stdout, stderr = st.session_state.storage_ssh.exec_command(f"ls {roll_path}")
-                            files_in_roll = stdout.read().decode().splitlines()
-                            if files_in_roll:
-                                st.write(f"Files in Roll: {files_in_roll}")
-                            else:
-                                st.warning("No files found in this roll path")
-                else:
-                    st.warning("No rolls found for the selected date")
-            if st.session_state.storage_ssh and st.session_state.selected_roll != "--Select--":
-               choice = st.radio(
-                    "Do you want to collect the full roll folder or defect-based data?",
-                    ["--Select--", "Full Roll Folder Zip", "Doff-based Zip"],
-                    index=0,
-                    key="collection_mode"
-                )
-               st.session_state.choice = choice
+    # -------------------------------
+    # Step 5: Choose Data Type & Zipping Method
+    # -------------------------------
+    if not selected_roll or selected_roll == "--Select--":
+        st.warning("Please select a roll first.")
+        st.stop()
 
-            if st.session_state.storage_ssh and st.session_state.choice == "Full Roll Folder Zip":
-                st.subheader("Full Roll Folder Zip")
-                # Ask user for custom zip filename (persistent)
-                custom_zip_name = st.text_input(
-                    "Enter a name for the zip file (without extension):",
-                    st.session_state.custom_zip_name,
-                    key="zip_name_input"
-                )
+# Safe to split now (must be outside the IF)
+    roll_number, roll_name = selected_roll.split(" - ", 1)
 
-                if st.button("Zip IT"):
-                    if not custom_zip_name.strip():
-                        st.error("Please enter a valid name for the zip file.")
-                    else:
-                        # Save it back to session so it persists
-                        st.session_state.custom_zip_name = custom_zip_name.strip()
 
-                        # Remote destination directory (on storage unit)
-                        remote_dest_dir = "/home/kniti/MegaUpload"
-                        remote_zip = f"{remote_dest_dir}/{custom_zip_name}.zip"
 
-                        # Ensure remote dir exists
-                        mkdir_cmd = f"mkdir -p {remote_dest_dir}"
-                        st.session_state.storage_ssh.exec_command(mkdir_cmd)
+    data_type = st.selectbox("Select Data Type", ["Select", "MDD", "FDA"])
+    roll_path = None
+    if data_type == "MDD":
+        roll_path = manager.MDD_DIR
+    elif data_type == "FDA":
+        roll_path = manager.FDA_DIR
 
-                        # --- FIX: run zip from the parent dir of the roll ---
-                        # Example: if roll_path=/home/kniti/projects/knit-i/knitting-core/data/34
-                        # we want cwd=/home/kniti/projects/knit-i/knitting-core/data
-                        roll_parent = os.path.dirname(roll_path)
-                        roll_name = os.path.basename(roll_path)
+    st.header("Step 5: Choose Zipping Method")
+    choice = st.radio("Select Zip Type", ["Select","Doff-based Zip", "Full Roll Zip"])
 
-                        zip_cmd = f"cd {roll_parent} && zip -r {remote_zip} {roll_name}"
+    # -------------------------------
+    # Step 6: Handle Zipping
+    # -------------------------------
+    if data_type == "Select":
+        st.warning("⚠️ Please choose either MDA or FDA to continue.")
+        st.stop()
 
-                        stdin, stdout, stderr = st.session_state.storage_ssh.exec_command(zip_cmd)
-                        exit_status = stdout.channel.recv_exit_status()
+    if choice == "Doff-based Zip":
+        st.subheader("📦 Doff-based Zipping")
 
-                        if exit_status != 0:
-                            st.error(f"Failed to create zip file on storage unit: {stderr.read().decode()}")
-                        else:
-                            st.success(f"✅ Remote zip created at: {remote_zip}")
-            if st.session_state.storage_ssh and st.session_state.choice == "Doff-based Zip":
-                if data_type == "MDD":
-                    handle_mda_doff_based_zip(choice, roll_path, roll_number, selected_date, st.session_state.storage_ssh)
-                else:  # FDA
-                    handle_fda_doff_based_zip(choice, roll_path, roll_number, selected_date, st.session_state.storage_ssh)
+        # Fetch rolls for the selected date
+        rows = db.fetch_rolls_by_date(selected_date)
+
+        # ✅ Resolve machineprgdtl_id from selected roll
+        selected_roll_obj = next(
+            (r for r in rows if f"{r[0]} - {r[1]}" == selected_roll),
+            None
+        )
+        machineprgdtl_id = selected_roll_obj[2] if selected_roll_obj else None
+
+        # ✅ Initialize handler (no selected_roll anymore)
+        handler = DoffBasedZipHandler(
+        choice=choice,
+        roll_path=roll_path,
+        roll_number=roll_number,
+        roll_name=roll_name,
+        selected_date=selected_date,
+        ssh_client=st.session_state.storage_ssh,
+        db=db,
+        machineprgdtl_id=machineprgdtl_id,
+        mill_name=mill_info.get("mill_name") if mill_info else None,
+        machine_name=machine_info.get("machine_name") if machine_info else None
+    )
+
+
+        # Handle MDD / FDA separately
+        if data_type == "MDD":
+            handler.handle_mda()
+        else:  # FDA
+                handler.handle_fda()  # ✅ you can still pass selected_roll here
+
+
+
+    elif choice == "Full Roll Zip":
+        st.subheader("📦 Full Roll Zipping")
+        zipper = FullRollZipper(st.session_state.storage_ssh, db=db)
+
+        # Fetch dynamically from DB selection
+        mill_name = mill_info.get("mill_name") if mill_info else None
+        machine_name = machine_info.get("machine_name") if machine_info else None
+
+        zipper.handle_full_roll_zip(
+            roll_path=roll_path,
+            rolls=db.fetch_rolls_by_date(selected_date),
+            selected_roll=selected_roll,
+            data_type=data_type,
+            mill_name=mill_name,
+            machine_name=machine_name
+        )
+
+
+
+if __name__ == "__main__":
+    main()

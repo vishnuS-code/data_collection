@@ -1,0 +1,7 @@
+docker run -d --name datacollection_app --restart always -p 8508:8508 \
+-e DB_NAME=central_database \
+-e DB_USER=postgres \
+-e DB_PASSWORD=55555 \
+-e DB_HOST=100.121.194.26 \
+-e DB_PORT=5432 \
+countaiadmin/datacollection:latest

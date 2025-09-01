@@ -1,5 +1,6 @@
 #db.py
 
+import datetime
 import pandas as pd
 import psycopg2
 import traceback
@@ -102,40 +103,38 @@ class RemoteFetchData:
             traceback.print_exc()
             return None
 
-    def fetch_roll_dates(self):
-        if not self.conn:
-            print(f"No connection to remote DB at {self.ip}")
-            return []
-        try:
-            cur = self.conn.cursor()
-            cur.execute("SELECT DISTINCT roll_start_date FROM roll_details WHERE roll_sts_id != 1 ORDER BY roll_start_date ASC;")
-            rows = [row[0] for row in cur.fetchall()]
-            cur.close()
-            return rows
-        except Exception as e:
-            print(f"Error fetching roll dates from {self.ip}: {e}")
-            traceback.print_exc()
-            return []
-
+  
     def fetch_rolls_by_date(self, selected_date):
         if not self.conn:
             print(f"No connection to remote DB at {self.ip}")
             return []
         try:
             cur = self.conn.cursor()
-            cur.execute("""
-                SELECT roll_number, roll_name ,machineprgdtl_id
-                FROM roll_details 
-                WHERE roll_start_date = %s AND roll_sts_id != 1
-                ORDER BY roll_number ASC;
-            """, (selected_date,))
+
+            # Range: selected_date 00:00 → next day 00:00
+            start_dt = datetime.datetime.combine(selected_date, datetime.time.min)
+            end_dt = datetime.datetime.combine(selected_date + datetime.timedelta(days=1), datetime.time.min)
+
+            query = """
+                SELECT roll_number, roll_name, machineprgdtl_id
+                FROM roll_details
+                WHERE roll_sts_id != 1
+                AND (
+                        (roll_start_date >= %s AND roll_start_date < %s) OR
+                        (roll_end_date   >= %s AND roll_end_date   < %s)
+                    )
+                ORDER BY roll_number DESC;
+            """
+            cur.execute(query, (start_dt, end_dt, start_dt, end_dt))
             rows = cur.fetchall()
             cur.close()
-            return rows  # [(roll_number, roll_name), ...]
+            return rows
         except Exception as e:
             print(f"Error fetching rolls from {self.ip}: {e}")
             traceback.print_exc()
             return []
+
+
 
 
     def fetch_machine_program_detail(self, machineprgdtl_id):
